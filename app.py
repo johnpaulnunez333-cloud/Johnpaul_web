@@ -1,13 +1,16 @@
 import hmac
 import os
 import re
-import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
+from urllib.parse import quote
 
+import psycopg2
+import psycopg2.extras
+import requests
 from flask import (
     Flask,
     abort,
@@ -16,7 +19,6 @@ from flask import (
     redirect,
     render_template,
     request,
-    send_from_directory,
     session,
 )
 from werkzeug.utils import secure_filename
@@ -28,11 +30,11 @@ try:
 except ImportError:
     pass
 
-BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", BASE_DIR / "uploads"))
-FILE_DIR = UPLOAD_DIR / "files"
-COVER_DIR = UPLOAD_DIR / "covers"
-DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", BASE_DIR / "loadout.db"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+FILE_BUCKET = os.environ.get("FILE_BUCKET", "files")
+COVER_BUCKET = os.environ.get("COVER_BUCKET", "covers")
 
 FILE_EXTENSIONS = {".apk", ".xapk", ".apks", ".obb", ".zip", ".7z", ".rar"}
 COVER_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -43,7 +45,7 @@ MAX_ENTRIES = 20
 app = Flask(__name__)
 app.config.update(
     SECRET_KEY=os.environ.get("SECRET_KEY") or os.urandom(32).hex(),
-    MAX_CONTENT_LENGTH=int(os.environ.get("MAX_UPLOAD_MB", "2048")) * 1024 * 1024,
+    MAX_CONTENT_LENGTH=int(os.environ.get("MAX_UPLOAD_MB", "50")) * 1024 * 1024,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE") == "1",
@@ -52,7 +54,7 @@ app.config.update(
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS games (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     title TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     category TEXT NOT NULL DEFAULT 'Other',
@@ -63,29 +65,47 @@ CREATE TABLE IF NOT EXISTS games (
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
     label TEXT NOT NULL,
     original_name TEXT,
     stored_name TEXT,
     url TEXT,
-    size INTEGER NOT NULL DEFAULT 0,
+    size BIGINT NOT NULL DEFAULT 0,
     downloads INTEGER NOT NULL DEFAULT 0
 );
 """
 
 
-def connect():
-    connection = sqlite3.connect(DATABASE_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+class StorageError(Exception):
+    pass
+
+
+class Database:
+    def __init__(self):
+        self.connection = psycopg2.connect(
+            DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor
+        )
+
+    def execute(self, sql, params=()):
+        cursor = self.connection.cursor()
+        cursor.execute(sql, params)
+        return cursor
+
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
+
+    def close(self):
+        self.connection.close()
 
 
 def get_db():
     if "db" not in g:
-        g.db = connect()
+        g.db = Database()
     return g.db
 
 
@@ -97,15 +117,78 @@ def close_db(error):
 
 
 def init_storage():
-    FILE_DIR.mkdir(parents=True, exist_ok=True)
-    COVER_DIR.mkdir(parents=True, exist_ok=True)
-    connection = connect()
-    connection.executescript(SCHEMA)
-    connection.commit()
-    connection.close()
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set.")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
+    db = Database()
+    db.execute(SCHEMA)
+    db.commit()
+    db.close()
 
 
 init_storage()
+
+
+def storage_headers(extra=None):
+    headers = {"Authorization": f"Bearer {SUPABASE_KEY}", "apikey": SUPABASE_KEY}
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def storage_upload(bucket, name, upload):
+    stream = upload.stream
+    stream.seek(0, 2)
+    size = stream.tell()
+    stream.seek(0)
+    try:
+        response = requests.post(
+            f"{SUPABASE_URL}/storage/v1/object/{bucket}/{quote(name)}",
+            headers=storage_headers(
+                {
+                    "Content-Type": upload.mimetype or "application/octet-stream",
+                    "x-upsert": "false",
+                }
+            ),
+            data=stream,
+            timeout=900,
+        )
+    except requests.RequestException:
+        raise StorageError("Could not reach the storage service. Try again in a moment.")
+    if not response.ok:
+        raise StorageError(
+            "Storage rejected the file. Free Supabase projects allow up to 50 MB per file. "
+            "Use an external download link for larger files."
+        )
+    return size
+
+
+def storage_remove(bucket, names):
+    names = [name for name in names if name]
+    if not names:
+        return
+    try:
+        requests.delete(
+            f"{SUPABASE_URL}/storage/v1/object/{bucket}",
+            headers=storage_headers({"Content-Type": "application/json"}),
+            json={"prefixes": names},
+            timeout=60,
+        )
+    except requests.RequestException:
+        pass
+
+
+def public_url(bucket, name, download_name=None):
+    url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{quote(name)}"
+    if download_name:
+        url += f"?download={quote(download_name)}"
+    return url
+
+
+def discard(uploaded):
+    for bucket in {item[0] for item in uploaded}:
+        storage_remove(bucket, [item[1] for item in uploaded if item[0] == bucket])
 
 
 @app.after_request
@@ -138,7 +221,7 @@ def serialize_file(row):
 
 def serialize_game(db, row):
     file_rows = db.execute(
-        "SELECT * FROM files WHERE game_id = ? "
+        "SELECT * FROM files WHERE game_id = %s "
         "ORDER BY CASE kind WHEN 'apk' THEN 0 WHEN 'data' THEN 1 ELSE 2 END, id",
         (row["id"],),
     ).fetchall()
@@ -150,7 +233,7 @@ def serialize_game(db, row):
         "category": row["category"],
         "version": row["version"],
         "package": row["package"],
-        "cover_url": f"/media/covers/{row['cover']}" if row["cover"] else None,
+        "cover_url": public_url(COVER_BUCKET, row["cover"]) if row["cover"] else None,
         "downloads": row["downloads"],
         "created_at": row["created_at"],
         "total_size": sum(item["size"] for item in files),
@@ -159,12 +242,7 @@ def serialize_game(db, row):
 
 
 def fetch_game(db, game_id):
-    return db.execute("SELECT * FROM games WHERE id = ?", (game_id,)).fetchone()
-
-
-def remove_stored(directory, name):
-    if name:
-        (directory / name).unlink(missing_ok=True)
+    return db.execute("SELECT * FROM games WHERE id = %s", (game_id,)).fetchone()
 
 
 def read_game_fields():
@@ -194,7 +272,7 @@ def read_cover():
 
 def save_cover(upload):
     stored_name = f"{uuid.uuid4().hex}{Path(upload.filename).suffix.lower()}"
-    upload.save(str(COVER_DIR / stored_name))
+    storage_upload(COVER_BUCKET, stored_name, upload)
     return stored_name
 
 
@@ -244,18 +322,17 @@ def parse_entries():
     return entries
 
 
-def store_entries(db, game_id, entries):
+def store_entries(db, game_id, entries, uploaded):
     for entry in entries:
         stored_name = None
         size = 0
         if entry["upload"] is not None:
             stored_name = f"{uuid.uuid4().hex}{entry['extension']}"
-            destination = FILE_DIR / stored_name
-            entry["upload"].save(str(destination))
-            size = destination.stat().st_size
+            size = storage_upload(FILE_BUCKET, stored_name, entry["upload"])
+            uploaded.append((FILE_BUCKET, stored_name))
         db.execute(
             "INSERT INTO files (game_id, kind, label, original_name, stored_name, url, size) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (game_id, entry["kind"], entry["label"], entry["original"], stored_name, entry["url"], size),
         )
 
@@ -278,11 +355,11 @@ def list_games():
     clauses = []
     params = []
     if query:
-        clauses.append("(title LIKE ? OR description LIKE ? OR package LIKE ?)")
+        clauses.append("(title ILIKE %s OR description ILIKE %s OR package ILIKE %s)")
         like = f"%{query}%"
         params.extend([like, like, like])
     if category and category != "All":
-        clauses.append("category = ?")
+        clauses.append("category = %s")
         params.append(category)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     order = "downloads DESC, id DESC" if sort == "popular" else "id DESC"
@@ -309,26 +386,16 @@ def list_categories():
 @app.get("/download/<int:file_id>")
 def download(file_id):
     db = get_db()
-    row = db.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+    row = db.execute("SELECT * FROM files WHERE id = %s", (file_id,)).fetchone()
     if row is None:
         abort(404)
-    db.execute("UPDATE files SET downloads = downloads + 1 WHERE id = ?", (file_id,))
+    db.execute("UPDATE files SET downloads = downloads + 1 WHERE id = %s", (file_id,))
     if row["kind"] == "apk":
-        db.execute("UPDATE games SET downloads = downloads + 1 WHERE id = ?", (row["game_id"],))
+        db.execute("UPDATE games SET downloads = downloads + 1 WHERE id = %s", (row["game_id"],))
     db.commit()
     if row["url"]:
         return redirect(row["url"])
-    return send_from_directory(
-        FILE_DIR,
-        row["stored_name"],
-        as_attachment=True,
-        download_name=row["original_name"],
-    )
-
-
-@app.get("/media/covers/<path:name>")
-def cover_file(name):
-    return send_from_directory(COVER_DIR, name)
+    return redirect(public_url(FILE_BUCKET, row["stored_name"], row["original_name"]))
 
 
 @app.get("/api/admin/session")
@@ -369,23 +436,36 @@ def create_game():
     if not entries:
         return jsonify(error="Add at least one file or download link."), 400
     db = get_db()
-    cover_name = save_cover(cover) if cover else None
-    cursor = db.execute(
-        "INSERT INTO games (title, description, category, version, package, cover, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (
-            fields["title"],
-            fields["description"],
-            fields["category"],
-            fields["version"],
-            fields["package"],
-            cover_name,
-            datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        ),
-    )
-    game_id = cursor.lastrowid
-    store_entries(db, game_id, entries)
-    db.commit()
+    uploaded = []
+    try:
+        cover_name = None
+        if cover:
+            cover_name = save_cover(cover)
+            uploaded.append((COVER_BUCKET, cover_name))
+        cursor = db.execute(
+            "INSERT INTO games (title, description, category, version, package, cover, created_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            (
+                fields["title"],
+                fields["description"],
+                fields["category"],
+                fields["version"],
+                fields["package"],
+                cover_name,
+                datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            ),
+        )
+        game_id = cursor.fetchone()["id"]
+        store_entries(db, game_id, entries, uploaded)
+        db.commit()
+    except StorageError as error:
+        db.rollback()
+        discard(uploaded)
+        return jsonify(error=str(error)), 502
+    except Exception:
+        db.rollback()
+        discard(uploaded)
+        raise
     return jsonify(serialize_game(db, fetch_game(db, game_id))), 201
 
 
@@ -402,25 +482,39 @@ def update_game(game_id):
         entries = parse_entries()
     except ValueError as error:
         return jsonify(error=str(error)), 400
-    cover_name = existing["cover"]
-    if cover:
-        remove_stored(COVER_DIR, existing["cover"])
-        cover_name = save_cover(cover)
-    db.execute(
-        "UPDATE games SET title = ?, description = ?, category = ?, version = ?, package = ?, cover = ? "
-        "WHERE id = ?",
-        (
-            fields["title"],
-            fields["description"],
-            fields["category"],
-            fields["version"],
-            fields["package"],
-            cover_name,
-            game_id,
-        ),
-    )
-    store_entries(db, game_id, entries)
-    db.commit()
+    uploaded = []
+    try:
+        cover_name = existing["cover"]
+        replaced_cover = None
+        if cover:
+            replaced_cover = existing["cover"]
+            cover_name = save_cover(cover)
+            uploaded.append((COVER_BUCKET, cover_name))
+        db.execute(
+            "UPDATE games SET title = %s, description = %s, category = %s, version = %s, "
+            "package = %s, cover = %s WHERE id = %s",
+            (
+                fields["title"],
+                fields["description"],
+                fields["category"],
+                fields["version"],
+                fields["package"],
+                cover_name,
+                game_id,
+            ),
+        )
+        store_entries(db, game_id, entries, uploaded)
+        db.commit()
+    except StorageError as error:
+        db.rollback()
+        discard(uploaded)
+        return jsonify(error=str(error)), 502
+    except Exception:
+        db.rollback()
+        discard(uploaded)
+        raise
+    if replaced_cover:
+        storage_remove(COVER_BUCKET, [replaced_cover])
     return jsonify(serialize_game(db, fetch_game(db, game_id)))
 
 
@@ -431,12 +525,11 @@ def delete_game(game_id):
     existing = fetch_game(db, game_id)
     if existing is None:
         return jsonify(error="Game not found."), 404
-    stored = db.execute("SELECT stored_name FROM files WHERE game_id = ?", (game_id,)).fetchall()
-    db.execute("DELETE FROM games WHERE id = ?", (game_id,))
+    stored = db.execute("SELECT stored_name FROM files WHERE game_id = %s", (game_id,)).fetchall()
+    db.execute("DELETE FROM games WHERE id = %s", (game_id,))
     db.commit()
-    for row in stored:
-        remove_stored(FILE_DIR, row["stored_name"])
-    remove_stored(COVER_DIR, existing["cover"])
+    storage_remove(FILE_BUCKET, [row["stored_name"] for row in stored])
+    storage_remove(COVER_BUCKET, [existing["cover"]])
     return jsonify(ok=True)
 
 
@@ -444,12 +537,12 @@ def delete_game(game_id):
 @admin_required
 def delete_file(file_id):
     db = get_db()
-    row = db.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+    row = db.execute("SELECT * FROM files WHERE id = %s", (file_id,)).fetchone()
     if row is None:
         return jsonify(error="File not found."), 404
-    db.execute("DELETE FROM files WHERE id = ?", (file_id,))
+    db.execute("DELETE FROM files WHERE id = %s", (file_id,))
     db.commit()
-    remove_stored(FILE_DIR, row["stored_name"])
+    storage_remove(FILE_BUCKET, [row["stored_name"]])
     return jsonify(ok=True)
 
 
